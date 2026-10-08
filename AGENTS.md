@@ -61,9 +61,10 @@ Four deliberate local differences, all of which must survive a port:
 2. **No daily/intraday split.** Every hourly pass does every feed (the daily files,
    intraday SCADA, intraday DispatchIS, the monthly interconnector archive, rooftop current /
    weekly / monthly) plus the DUID reference, self-gated on data rather than on a schedule:
-   each DUID reference file is downloaded when its log row is 24h old, and the backfills (the
-   GitHub historical listing, the monthly archives, the weekly rooftop archives) only run when
-   AEMO returned fewer than `download_limit` new daily files. `download_limit` is per feed.
+   each DUID reference file is downloaded when its log row is 24h old; the Daily_Reports folder
+   is only listed while the log lacks yesterday's (Brisbane) next-day file; and the backfills
+   (the GitHub historical listing, the monthly archives, the weekly rooftop archives) only run
+   when that listing ran and returned fewer than `download_limit` new daily files. `download_limit` is per feed.
    **A source that fails skips itself, not the run**: a nemweb folder that can't be listed,
    or a reference file that can't be fetched, prints a `::warning::` and that feed downloads
    nothing this pass; the previous reference file and its log row stay. The model must not
@@ -162,18 +163,21 @@ The ids live in repository **variables** (public identifiers, not secrets):
   `dbt_fabric_python_iceberg`, no client secret; shared with the sibling repo)
 - `WS_ID`, `LH_ID` — the Fabric workspace (`power`) and lakehouse (`nem`). The workflows build
   `WAREHOUSE_PATH = {WS_ID}/{LH_ID}` and `FILES_PATH = abfss://{WS_ID}@onelake.dfs.fabric.microsoft.com/{LH_ID}/Files`
-  directly from them. **No workflow creates or looks up a lakehouse** — that is infrastructure,
-  created once by hand (schema-enabled, since the models write to `landing`/`mart`). If it is
-  ever recreated, update `LH_ID`; CI is deliberately not in the provisioning business.
+  directly from them. **No workflow creates or looks up this lakehouse** — that is
+  infrastructure, created once by hand (schema-enabled, since the models write to
+  `landing`/`mart`). If it is ever recreated, update `LH_ID`. (`deploy_fabric.yml` creates a
+  lakehouse, but its own, in the workspace it installs into: see "The whole stack in one
+  workspace".)
 - `LAKE_TENANT_ID`, `LAKE_CLIENT_ID` — the Fabric app's tenant and an Entra app there
   (`fabric-github-deploy`), a member of the app's workspace: it uploads the data
-  (`scripts/deploy_onelake.py`) and is the identity of the parked `deploy_fabric.yml`.
+  (`scripts/deploy_onelake.py`) and is the identity of `deploy_fabric.yml` into a fabriccat
+  workspace (the catalog's tenant gets `AZURE_CLIENT_ID`).
   It is a second tenant: `deploy_onelake.py` exchanges the job's GitHub OIDC token itself,
   next to the workflow's catalog login. The app's
   federated credential for this repo has the subject
   `repo:djouallah/analytics-as-code:ref:refs/heads/main`.
 - `FABRIC_APP_WORKSPACE_ID` (workspace `app`), `ONELAKE_FILES_URL` (the lakehouse's Files
-  folder, where the app's function signs its SAS) — `deploy_fabric.yml`.
+  folder, where the wasm app's function signs its SAS).
 Env contract consumed by profiles.yml, the models and the scripts: `ONELAKE_ENDPOINT`,
 `ONELAKE_TOKEN`, `WAREHOUSE_PATH`, `FILES_PATH`, `download_limit`, `process_limit`,
 `ALL_PERIODS` (the two import workflows), plus
@@ -184,13 +188,16 @@ transport fails the OneLake TLS handshake).
 ## Dashboard
 **The layout says who reads the model:** `semantic_model/` at the top of the repo is the one
 semantic model, and `dashboard/` holds its clients: `github/` (the page, on GitHub Pages),
-`fabric_app_wasm/` (the same page as a Fabric app, on DuckDB-WASM), `powerbi_report/`
-(`nem.Report`, a report over the deployed model) and `fabric_app_vertipaq/` (a README: the
-page as a Fabric app on the deployed model, not built; see "The Fabric app on VertiPaq").
-The Fabric apps are named by their engine.
+`fabric_app/` (the same page as a Fabric app) and `powerbi_report/` (`nem.Report`, a report
+over the deployed model). **`dashboard/fabric_app/` is one app and two backends**, as
+`github/` is one page and two ways of asking: `common/` (`build.mjs` and the Fabric sign-in,
+`site/storage/auth.js`), `wasm/` (DuckDB-WASM over a copy of the tables, deployed) and
+`vertipaq/` (the deployed model as the engine, installed by `deploy_fabric.yml`; see "The
+whole stack in one workspace"). Each backend is a Rayfin project of its own, named by its
+engine.
 **`dashboard/github/` is one page and two ways of asking:**
 `common/` (`index.html`, `frontend/` draw.js, logs.js, perflog.js, `storage/`, `dag/`), `dax/`
-(`frontend/queries.js` and `semantic/compiler.js`: the page through the semantic model) and
+(`frontend/queries.js` and `semantic/query.js`: the page through the semantic model) and
 `sql/` (`frontend/queries.js`: the page in plain SQL, with no semantic layer, each member one
 SELECT over the views, its figures written in SQL: how a team would build the page in
 practice). A page is `common/` with one of the two copied over it
@@ -211,8 +218,8 @@ on both except `storage/data.js`.
 - query language: the page's queries, objects of the model's fields (`select`, `where`, ...),
   which the compiler writes as DAX
 - semantic model: `semantic_model/model.bim` (at the top of the repo), a Tabular model in TMSL
-- compiler: `semantic/compiler.js`, the model's relationships to views, the page's queries to
-  DAX and the DAX to SQL
+- query: `semantic/query.js`, the page's queries to DAX (`toDax`)
+- compiler: `packages/dax-sql` (staged as `semantic/dax-sql/`), the DAX to SQL
 - engine: DuckDB-WASM
 - storage: `storage/data.js`, `storage/history.js`, `storage/views.js` (a view per table)
 - and the Logs tab, `frontend/`
@@ -222,16 +229,18 @@ on both except `storage/data.js`.
 `frontend/queries.js`, not `index.html`.
 
 **It is a proof of concept; the point is that the layers are there, in the formats of a
-real product.** The compiler is not a DAX engine. It knows the constructs the
-page uses and throws on anything else (`DAX: X is not supported`), and where DAX and SQL
-differ the result is SQL's: a blank is a NULL, and there is no filter context (a filter is a
-boolean argument of `CALCULATETABLE` or `CALCULATE`). Its rows are DAX's:
-`SUMMARIZECOLUMNS` leaves out a group whose measures are all blank (a `HAVING`), and `TOPN`
-is descending unless `ASC` and keeps the rows tied with the n-th (`QUALIFY RANK()`). Don't
-grow it into a general engine. Of the rules a query compiler applies on its own, it
-applies one, when a join is needed (below). Which table a measure reads is the model's rule,
-which the compiler answers from the query; which grain a date range gets, and MW to MWh, are
-the page's.
+real product.** The compiler is two steps, as in Power BI: the page's query becomes DAX
+(`toDax`, in `semantic/query.js`, which knows the page's words and nothing of SQL), and the DAX
+becomes SQL in `packages/dax-sql`, a general DAX compiler: any Tabular model, DAX's filter
+context, context transition, relationships and blanks (see its README and DESIGN.md). Its
+rows are DAX's: `SUMMARIZECOLUMNS` leaves out a group whose measures are all blank, `TOPN`
+keeps the rows tied with the n-th, an ascending `ORDER BY` puts blanks first. **dax-sql
+knows nothing of this model, this page or this data**: no case for a measure, a table or a
+query, and nothing it assumes of the data that the model does not declare
+(`relyOnReferentialIntegrity`, or the page's `assumeIntegrity`). A change there is a
+general rewrite, checked by its own tests and by the page's (below), never a case for a
+query. Which table a measure reads is the model's rule, which DAX answers from the query;
+which grain a date range gets, and MW to MWh, are the page's.
 **The page knows no DAX.** An agent must not be able to write arbitrary DAX, inline
 calculations and the like into the page; a query asks the way a report visual does, and
 `grep -i dax` finds nothing in `index.html` or `frontend/queries.js`. A query is an object of
@@ -240,7 +249,7 @@ the model's fields, and these words only:
 `{ min | max: column }`, a key's first or last value), `where` (conditions on columns:
 `= <> < <= > >= between in notIn blank notBlank`, and `{ any: [...] }`; a value is a string,
 a number, true or false, or a date), `having` (on a value of the select), `totals` (a
-subtotal over some of the select's columns), `orderBy` and `top`. `toDax` in `compiler.js`
+subtotal over some of the select's columns), `orderBy` and `top`. `toDax` in `query.js`
 writes its DAX, checking each column and measure against `model.bim`, and `query()` refuses
 DAX text. What DAX needs that a query does not say is the compiler's to add: a query of a
 dimension's columns alone leaves out the blank row DAX gives a dimension whose key a fact
@@ -298,7 +307,6 @@ its `orderBy` asks. A measure changed in the model that the SQL page does not fo
 there. With an output file it writes the shape `parity_model.py` reads, the DAX next to the
 SQL page's rows, to ask the model directly.
 Rules these checks hold the page and the model to:
-- A query of a fact and two of its dimensions reads `<fact>_star`.
 - A count of no rows is blank, as in DAX, not 0.
 - `dim_duid` has one spelling per name (VertiPaq compares text case-insensitively, DuckDB
   does not).
@@ -328,8 +336,8 @@ finds `data/` from the page's URL. **The repo tree is not the served tree**: a p
 or imports the page stages it first: the site (`build.yml`, `import_data.yml`), the Fabric
 app's build, the parity scripts. To serve it from a laptop, stage the site into a folder
 (`node scripts/stage_pages.mjs <dir> <build>`) and put a copy of `data/` next to it. A relative
-import is of the staged tree (`dax/semantic/compiler.js` imports `../storage/views.js`, which
-is `common/`'s).
+import is of the staged tree (`dax/semantic/query.js` imports `./dax-sql/index.js`, which
+`stagePage` copies there from `packages/dax-sql/src`).
 - `dashboard/github/common/index.html` is the page: the charts, which draw what
   `dashboard/github/dax/frontend/queries.js` asks: every query the charts send, by tab and chart
   (`createQueries(page)`, over the page's state passed in as functions; the renderers only
@@ -365,86 +373,30 @@ is `common/`'s).
   otherwise. `.platform` and `definition.pbism` next to it make the folder a Fabric item.
   It is JSON, so a browser reads it with no library: there are no comments, so the why goes
   in a `description`, and a long expression is an array of lines.
-- `dashboard/github/common/storage/views.js` (`withViews(data, items)`, which every `data.js`
+- `dashboard/github/common/storage/views.js` (`withViews(data)`, which every `data.js`
   returns itself wrapped in) is the tables as views: a view `v_<table>` per table attached,
   over the files (the table whole in `dim` or `agg`, or split by date over `today` and the
   half-years: `today` has the days it holds, cut at a literal date; the files are stacked by
   column name, so one built before a column was added reads as NULL in it). It creates them
   after every attach: one query reads what is attached from the engine's catalog
   (`information_schema`), and one runs the statements that are new or changed. It adds
-  `views`, `has`, `needs` and `requires` to the data source: `needs(sql)` says what a SQL
+  `views`, `has` and `needs` to the data source: `needs(sql)` says what a SQL
   query reads; `ensureHistory` attaches nothing for a range that starts inside the days
-  `today` holds, so the default view fetches no history. A layer above wraps it again with
-  views of its own over these (`items`: relationships, a fact with its dimensions).
-- `dashboard/github/dax/semantic/compiler.js` has two parts (`createModel(dataSource)`: the
-  data source's members, its views plus the model's, `toDax` and `toSQL`). **It is a toy on
-  purpose**: an example of where that layer of the stack sits, not a DAX engine. It
-  translates what this page asks, by fixed cases; it does not plan, and a construct it cannot
-  translate gets its equivalent SQL written here, never a general mechanism.
-  The model: the data source's `v_<table>` (a table of the model is the lakehouse table of
-  its own name), and a view per relationship under its name (`fct_summary_to_dim_duid`: the
-  fact LEFT JOIN the dimension) and per fact with two of its dimensions, created by
-  `withViews` over them.
-  The queries: `toDax(query)` writes the page's query as DAX, and `toSQL(dax)` turns that
-  into one SELECT over those views, the same text once (a Map). The header of the file lists
-  what each DAX construct becomes. To know:
-  - It picks the view from the tables a query names: `fct_summary` alone reads
-    `v_fct_summary`, with a column of `dim_duid` the relationship's view.
-  - The key of a dimension (`dim_calendar[date]`, `dim_time[time]`, `dim_region[Region]`,
-    `dim_duid[DUID]`) is read off the fact's own column: no join for it.
-  - The result is cast by the column's `dataType` for the browser: a date as VARCHAR, a
-    whole number as INTEGER, a number as DOUBLE. A subquery or a CTE is left as it is.
-  - A `[Name]` that is not a column of the table being built is a measure, and its
-    expression is written out in its place: there are no macros. Under `CALCULATE` its
-    aggregates take the `FILTER (WHERE ...)`.
-  - A measure that picks its table, `IF([Reads 5 minutes], a, b)`, picks it here as in
-    Power BI: `ISFILTERED` and `ISCROSSFILTERED` are answered from the columns the query's
-    keys and filters name around the measure, and an `IF` on one keeps the side it picks;
-    the other is never translated.
-  - **A measure of another table is a subquery of its own.** A SELECT is about
-    one table, the one its first measure is defined on. A measure defined on another
-    (`[Hours]`, the regions', inside `[Capacity factor]`; `[Month days]` inside
-    `[Average MW at hour]`) is written as a
-    subquery: that measure under the filters around it that reach its table along the
-    relationships, grouped by the keys that do and matched on them. It is what the filter
-    context does: a filter on `dim_calendar` reaches every fact, one on `dim_duid` or on
-    `fct_summary[date]` only the units. For the same reason a filter on another fact is
-    left out of the SELECT it does not reach. So a query that calls a two-fact measure
-    filters each fact (`queries.whereAll`): up to 30 days `fct_summary[date]`,
-    `fct_region[date]` and `dim_calendar[date]`, beyond `dim_calendar[date]` with
-    `wholeDays`; and the region on `dim_region[Region]`, which reaches all three.
-    The subquery is a CTE, read once per query and looked up per row of the result
-    (inline, a measure named twice would be read twice).
-    A blank from such a subquery is 0, as DAX adds it. Not supported: under a subtotal of
-    a key that reaches it. In a measure of the model `<>` is DAX's (`IS DISTINCT FROM`: a
-    blank fuel is not "Grid"); in the page's own filters it stays SQL's.
-  - A relationship that filters both ways (`crossFilteringBehavior: bothDirections`, read
-    from the bim: `dim_duid_to_dim_region`) lets a filter on its `from` table reach the
-    tables of its `to` side as the keys its rows have: a unit filter on `fct_region` is
-    `REGIONID IN (SELECT Region FROM v_dim_duid WHERE ...)`. A subquery is still grouped
-    only by the keys that reach its table forwards.
-  - `CALCULATE(m, ALLSELECTED(table))` (`[Generation share]`) is m over everything the query
-    selects, not grouped by that table's columns: a window over the groups when m is a sum of
-    the SELECT's own table (then the SELECT's conditions on values go to QUALIFY, so the share
-    is of every group), else a subquery. `CALCULATE(m, DATESBETWEEN(dim_calendar[date], a,
-    b))` (the `[... change]` measures) is m over those days instead of the query's, a and b
-    worked out here from the query's literal range (`MIN`/`MAX` of `dim_calendar[date]`,
-    `DATEDIFF` in days). A CALCULATE of a measure of another table takes its filters into
-    that measure's subquery (`[Demand with rooftop MW]`). A count of no rows is blank, as in
-    DAX. A query of a fact and two of its dimensions reads `<fact>_star`.
-    The header of `compiler.js` lists every place its SQL is knowingly not DAX.
-  - Its fixed cases for this model: the days the daily table lacks, which a measure adds
-    from the 5-minute table (`dim_calendar[date] > [Newest whole day]`), are none: the page
-    restricts a long range to the days the daily table holds (`queries.wholeDays`), which
-    makes that set empty in DAX too. So a long range ends on the newest whole day on the
-    page, and on the newest interval in Power BI. `[Units]` off the daily table is
-    `COUNT(DISTINCT DUID)`. `MAX(column, 0)` and `MIN(column, 0)` read the column as
-    DOUBLE: a sum of fixed decimals is 128-bit and slow. `[Capacity MW]`, the capacity of
-    the units that have rows
-    (`CALCULATE(SUM(dim_duid[RegCapMW]), SUMMARIZE(fact, dim_duid[DUID]))`), makes its
-    SELECT two levels: the rows per unit first (its sums, its capacity once), then the
-    groups asked for (`perUnit`); in one level, as `list(DISTINCT {DUID, RegCapMW})`, it is
-    several times slower in the browser.
+  `today` holds, so the default view fetches no history.
+- `dashboard/github/dax/semantic/query.js` (`createModel(dataSource)`: the data source's
+  members, `toDax` and `toSQL`): `toDax(query)` writes the page's query as DAX, checking each
+  column and measure against `model.bim`; `toSQL(dax)` is `packages/dax-sql`'s compile of it
+  over the data source's `v_<table>` views (staged next to the compiler as `semantic/dax-sql/`
+  by `stagePage`), the same text once (a Map). The page's options: `assumeIntegrity` (a
+  dimension's key is read off the fact: the dbt tests keep the data so) and its casts for the
+  browser (a date as VARCHAR, a whole number as INTEGER, a number as DOUBLE: a BIGINT reaches
+  the page as a BigInt). How dax-sql writes its SQL (fused scans, a subquery read once,
+  decorrelation across a relationship that filters both ways) is in its DESIGN.md.
+  Checked, offline, on every push (`build.yml`): dax-sql's own tests on made-up data;
+  `sql_page.mjs`, the SQL page against the DAX page on the deployed files (the deploy waits
+  for it); `compiler_ab.mjs`, the compiler against the commit before, rows and time (a report,
+  with the slower queries' SQL and plans as an artifact). Against the model: the parity
+  (`deploy_model.yml`).
 - `storage/data.js` is the host: how the `.duckdb` files are fetched, cached and attached
   (`createDataSource`: `init`, `attachAgg`, `ensureHistory`, `query`, wrapped by
   `views.js`). It attaches `dim`, `today`, `agg` and the 5-minute history. On both the files
@@ -453,7 +405,7 @@ is `common/`'s).
   - `dashboard/github/common/storage/data.js`, GitHub Pages: the files sit in `data/`
     (`mart_dim`, `mart_today`, `mart_agg`, `mart_<YYYY>_h<N>`), with `mart_manifest.json`
     listing the half-years.
-  - `dashboard/fabric_app_wasm/site/storage/data.js`, the Fabric app: the files are in a
+  - `dashboard/fabric_app/wasm/site/storage/data.js`, the Fabric app: the files are in a
     lakehouse behind a Fabric sign-in, read with a short-lived read-only SAS, and downloaded
     as 2 MB Range requests, 6 at a time. Its own, and unknown to the page: the sign-in gate
     (`auth.js`, next to it) and the SAS (`sas.js`).
@@ -490,7 +442,7 @@ rather than round them:
   `[data-theme="light"]`, set by the `<head>` script before first paint: the stored choice,
   else the system's). Colour is for the data and for status, and status comes with an arrow
   or a label. The CSS stays inline: a separate file next to `index.html` would need both
-  deploy copy lists (`build.yml`, `dashboard/fabric_app_wasm/build.mjs`).
+  deploy copy lists (`build.yml`, `dashboard/fabric_app/common/build.mjs`).
 - `chartTheme()` builds one ECharts theme per scheme from those tokens (font, label size,
   tooltip, legend, zoom slider, colour scale) and `plot()` is every chart's plot area, with
   measured axis labels. A chart sets no margin, font or tooltip style of its own.
@@ -515,7 +467,7 @@ rather than round them:
   link's small chart in its row; the History calendar lays its years out to fill the card; a
   tab's notes are an (i) popover. A new chart goes into a cell of that grid, not under it.
 
-**Checking a change to `model.bim`, `compiler.js`, a `data.js` or the page:** in headless
+**Checking a change to `model.bim`, `packages/dax-sql`, `query.js`, a `data.js` or the page:** in headless
 Chrome, the page before against the page after on one copy of the deployed files, through
 the same page states; compare what each chart draws (its ECharts series) and the SQL that
 ran (the Logs tab has it, translated), read `EXPLAIN` for a join that was not there, and
@@ -533,7 +485,7 @@ depth-1 clone, the published paths added with `-f` (so the deploy repo's `.gitig
 skip a file), push retried on a race. It only adds and replaces: a file leaves the site by
 hand, in the deploy repo.
 **Every build stamps its files** (`scripts/stamp_build.mjs`, run by `build.yml` and by
-`dashboard/fabric_app_wasm/build.mjs`): `__BUILD__` becomes the build, and every relative
+`dashboard/fabric_app/common/build.mjs`): `__BUILD__` becomes the build, and every relative
 import gets `?v=<build>`. Pages serves the files with `max-age=600`, so without it a browser
 would run the new page with its cached old modules for up to 10 minutes after a deploy. A
 harness that imports a module itself from a stamped copy has to add the same `?v=`, or it
@@ -568,26 +520,27 @@ of two imports are kept so that an open page keeps reading the one it attached. 
 OPFS cache keeps one import, so each daily import downloads a half-year again the first time
 it is viewed.
 
-**The Fabric app is `dashboard/fabric_app_wasm/`**, a Rayfin project: static hosting, Fabric
-sign-in, and one function, `getDataSas` (`dashboard/fabric_app_wasm/rayfin/functions`), which
+**The Fabric app is `dashboard/fabric_app/wasm/`**, a Rayfin project: static hosting, Fabric
+sign-in, and one function, `getDataSas` (`dashboard/fabric_app/wasm/rayfin/functions`), which
 signs a read-only SAS on the data folder so that the browser never holds a storage token.
-`dashboard/fabric_app_wasm/build.mjs` assembles `dashboard/fabric_app_wasm/dist`: the DAX
-page staged (`stagePage('dax')`: `common/`, `dax/` and `semantic_model/model.bim`) and the
-dbt docs, with `dashboard/fabric_app_wasm/site/` copied over them (`storage/data.js`, its
-own, `storage/auth.js` and `storage/sas.js`), and `?v=<build>` added to every relative
-import; `compiler.js` passes its own on to `model.bim`. The project is the working
-directory of `build.mjs`.
+`dashboard/fabric_app/common/build.mjs` assembles a project's `dist/` (here
+`dashboard/fabric_app/wasm/dist`): the DAX page staged (`stagePage('dax')`: `common/`,
+`dax/` and `semantic_model/model.bim`) and the dbt docs, with `fabric_app/common/site/`
+(`storage/auth.js`) and then the project's own `site/` copied over them (here
+`storage/data.js` and `storage/sas.js`), and `?v=<build>` added to every relative import;
+`query.js` passes its own on to `model.bim`. The project is the working directory of
+`build.mjs` (`npm run build:fabric` in it).
 
 **It is deployed from the owner's laptop**, under their own login:
 ```
-cd dashboard/fabric_app_wasm
+cd dashboard/fabric_app/wasm
 npm ci && npm ci --prefix rayfin/functions
 export RAYFIN_TOKEN=$(az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv)
 npx rayfin up --yes --output json
 ```
 The item is `wasm` in workspace `app`;
-`dashboard/fabric_app_wasm/rayfin/.deployments.json` (untracked) records it, and its URL is in
-`dashboard/fabric_app_wasm/rayfin/rayfin.yml` (`allowedRedirectUris`; the deploy adds it). On
+`dashboard/fabric_app/wasm/rayfin/.deployments.json` (untracked) records it, and its URL is in
+`dashboard/fabric_app/wasm/rayfin/rayfin.yml` (`allowedRedirectUris`; the deploy adds it). On
 a machine without that record, add `--workspace-id <app>`. A new item needs its secret once,
 then one more deploy: `echo <Files URL> | npx rayfin secret set ONELAKE_FILES_URL --stdin`.
 
@@ -596,18 +549,11 @@ it; the owner is also the identity `getDataSas` reads the lakehouse as. That is 
 laptop and CI cannot share an item: a deploy to someone else's fails with
 `403 Only AppBackend artifact owner can perform this operation`.
 
-**`deploy_fabric.yml` with `app=wasm` is parked** (dispatch only), waiting for a fix
-upstream. It runs the same `rayfin up` with a Fabric API token from the OIDC login, no
-secret, into an item of its own (`nemtracker`), and the deploy works. The app it makes does
-not: Fabric answers 500 ("An internal error occurred.") to every function call on an item
-owned by a service principal, before the function runs. That is microsoft/rayfin#89, open,
-with this repo's case in its comments. It is not the federated login, which works, and not
-permissions: OneLake issues the CI identity a delegation key (the workflow's last step
-checks it). The page-only deploy into the owner's item (`rayfin up staticapp deploy`) is no
-way round it: owner-only too, the same 403. When #89 is fixed: dispatch the workflow, open
-`nemtracker`, read its Logs tab. Keep that item until then: the comment on #89 says it is
-there for re-testing. What the workflow needs:
-- `dashboard/fabric_app_wasm/rayfin/functions/host.json` is committed: the deploy refuses
+**The wasm app from CI deploys but does not work yet** (`deploy_fabric.yml`'s
+`fabric_app_wasm`, item `nemtracker`): Fabric answers 500 ("An internal error occurred.") to
+every function call on an item owned by a service principal, before the function runs
+(microsoft/rayfin#89, open, with this repo's case in its comments). The CI deploy needs:
+- `dashboard/fabric_app/wasm/rayfin/functions/host.json` is committed: the deploy refuses
   without it, and the Rayfin scaffold's `.gitignore` leaves it out.
 - The lock files resolve from `registry.npmjs.org`: generated on a laptop they name a
   private feed the runner cannot read.
@@ -621,27 +567,38 @@ Rules of the Fabric host that are easy to break:
   Fabric sign-in popup.
 To check a deploy, open the Logs tab: the build stamp, each fetch, attach and query.
 
-### The Fabric app on VertiPaq
-`dashboard/fabric_app_vertipaq/` holds a README only: the app is not built. It would be the
-page with the deployed semantic model as its engine (Power BI running its queries in Direct
-Lake over the `mart` tables, no DuckDB, no copy of the data), deployed from CI into
-workspace `power` next to the model, as the model is. It is to be built the way Rayfin
-recommends, not by carrying the compiler over: the page sends query objects, not DAX.
-- **Blocked by the region:** Fabric refuses to create an app item in `power`
-  (`403 The feature is not available`). The workspace's capacity is in Australia Southeast,
-  where Fabric apps (preview) are not available (Australia East has them; microsoft/rayfin#8).
-  The app needs a workspace on a capacity in a region that has Fabric apps, in the model's
-  tenant (a connector can name the model's workspace, so the app's can be another one), or
-  the region to get the feature.
-- **The route to the model:** a Rayfin connector of type `fabric-semanticmodel`
-  (`executeQuery`, delegated): the browser calls the app's backend, which runs the query on
-  the model as the signed-in user, so the browser holds no Power BI token and a reader sees
-  what their own access allows. A function cannot do it: functions have no Power BI audience
-  and run as the item's owner. A service principal can call the model on that route (Power
-  BI's `executeDaxQueries`, with a token for `https://analysis.windows.net/powerbi/api`);
-  the delegated path in a browser is untested.
-- `deploy_fabric.yml` still offers `app=vertipaq`; there is no project in the folder for it
-  to deploy.
+### The whole stack in one workspace
+`deploy_fabric.yml` (dispatch: `tenant_id`, `workspace_id`, and a tick per part, all on by
+default: `data`, `semantic_model`, `powerbi_report`, `fabric_app_vertipaq`,
+`fabric_app_wasm`) installs the project into one
+Fabric workspace, independent of everything GitHub runs: the mechanism of the sibling
+`fabric-medallion-dbt` (`.github/scripts/deploy.py`), ported. `scripts/deploy_fabric.py`:
+- publishes `fabric_items/` with fabric-cicd: the lakehouse `nem` (schema-enabled), the
+  Python notebook `run` and the pipeline `run_pipeline` that calls it;
+- uploads the dbt project (`git archive HEAD`) to `nem/Files/project`, with a `COMMIT` file;
+- runs the pipeline once and waits: the model names tables a first run creates;
+- publishes the model and the report with `deploy_model.main()`, on that lakehouse;
+- schedules the pipeline hourly, if it has no schedule.
+Then the workflow deploys `dashboard/fabric_app/vertipaq/` (item `vertipaq`), its connector
+naming the model `nem` of the same workspace, and `dashboard/fabric_app/wasm/` (item
+`nemtracker`, CI's own: the laptop's `wasm` refuses another owner), which reads the
+`.duckdb` files of `import_onelake.yml` and fails until microsoft/rayfin#89 is fixed. The workspace must exist, on a capacity in a
+region with Fabric apps (preview); the login is the repo's Entra app of that tenant
+(`AZURE_*` or `LAKE_*`), any other tenant fails at the first step.
+The notebook does what `process_data.yml` does: the same env contract (from `notebookutils`:
+the workspace, the lakehouse's id, a storage token), `pip install -r requirements.txt`, and
+the same two `dbt run --target prod`. No `rebuild`, maintenance, tests or `.duckdb` import
+there: those stay on GitHub, for the `power` catalog.
+
+**The VertiPaq app** is the page with the deployed semantic model as its engine (Power BI in
+Direct Lake over the `mart` tables, no DuckDB, no copy of the data). Its
+`site/storage/data.js` sets `engine: 'dax'`, and the compiler's `createModel` then sends each
+query's DAX (`toDax`) to it as it is, with no views and no SQL; with no `needs`, the page
+leaves out Analyze. The route to the model is a Rayfin connector of type
+`fabric-semanticmodel` (`executeQuery`, delegated): the app's backend runs the query on the
+model as the signed-in user, so the browser holds no Power BI token. Not in `power`: its
+capacity is in Australia Southeast, where Fabric refuses an app item
+(`403 The feature is not available`, microsoft/rayfin#8).
 
 A table or a column the page asks for and a deployed file lacks reads as "no data" where
 the page checks (`data.has`), so a new page can go out before its data; a new table goes
@@ -765,7 +722,7 @@ in `landing` are what these tables are built from.
 |-------|--------|-----------------|
 | stg_csv_archive_log | landing | incremental append (Python) — only rows missing from the target; the durable log is `Files/csv_archive_log.parquet` |
 | processed_files | landing | incremental append — the files each landing fact has loaded (`model, csv_filename, processed_at`), appended by the facts' post-hooks; the pending check is the log minus this table. A `rebuild=<fact>` appends a reset row (`csv_filename` NULL); the first build seeds it from the facts' `file` columns |
-| dim_calendar | mart | incremental append (the NOT-IN filter keeps existing dates out; runs 2 years ahead) |
+| dim_calendar | mart | incremental append (the NOT-IN filter keeps existing dates out; runs 2 years ahead; a run sends nothing once it reaches that far) |
 | dim_duid | mart | incremental insert-only merge on DUID; NEM units from the registration list, then `duid_unregistered.csv`; registered capacity (RegCapMW etc.); `Renewable` — **the list of renewable fuels lives in this model** (an inline CTE next to `states`), nowhere else; `Classification` from the list (Scheduled / Semi-Scheduled / Non-Scheduled, stars stripped; NULL off the list): curtailment is measured on Semi-Scheduled, not on a fuel, because HPR1 (a battery) is registered with fuel "Wind"; `CO2eFactor` (t CO2-e/MWh) from MMSDM `GENUNITS` through `DUALLOC`, for registered and unregistered units alike, NULL for loads, AEMO's dummy units and the gensets "On Exclusion List" (Colongra, Jeeralang, Braemar 3 and 6), which `[Emissions t]` therefore leaves out; `Storage` (a battery, the fuel "Grid": the one place that rule lives), `Plant` (the station, or the unit when it has none: what the page groups units by) and `Owner` (the participant, rooftop's five units "Rooftop solar (AEMO estimate)"); one spelling per name, case-insensitively, for StationName, Participant and TechnologyType (VertiPaq stores text case-insensitively). A new column or a changed rule reaches the existing rows with a `rebuild=dim_duid` |
 | fct_scada, fct_price | landing | incremental insert-only merge (by file) |
 | fct_scada_today, fct_price_today | landing | incremental insert-only merge (by file) |

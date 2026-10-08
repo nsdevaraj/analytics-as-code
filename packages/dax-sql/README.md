@@ -5,7 +5,7 @@ and Analysis Services use) and turns DAX queries over it into one SQL query each
 semantics: filter context, context transition, relationships, blanks. Tested on DuckDB, with a
 dialect layer for other engines.
 
-It is the general-purpose counterpart of `dashboard/github/semantic/compiler.js`, which knows
+It replaced the fixed cases of the page's former `dashboard/github/dax/semantic/compiler.js`, which knew
 this repository's model and page only. That one stays as it is; the page does not use this
 package. The page's queries are part of this package's tests.
 
@@ -44,7 +44,7 @@ No runtime dependencies; ES modules for the browser and Node 18+.
 | `tableSource` | `(table) => SQL` naming a model table's rows. Default: its partition's entity, `"schema"."entity"`. |
 | `dialect` | `'duckdb'` (default), or an instance of a `Dialect` subclass. |
 | `columnNames` | `'short'` (default): the column's or the expression's name. `'dax'`: `Table[Column]`, `[Measure]`. |
-| `castOutput` | `true` (default): whole numbers as `BIGINT`, other numbers as `DOUBLE`. |
+| `castOutput` | `true` (default): whole numbers as `BIGINT`, other numbers as `DOUBLE`. Or an object, by the column's type (`int`, `double`, `decimal`, `datetime`, `string`, `bool`), of a function of its SQL: `{ int: s => \`CAST(${s} AS INTEGER)\` }`; a type it leaves out is not cast. |
 | `assumeIntegrity` | `true`: every relationship relies on referential integrity, so a dimension key is read off the fact's foreign key without a join. By default only relationships whose `relyOnReferentialIntegrity` is set are treated this way. |
 | `blankRows` | `false`: no blank row for dimensions (see below), which saves a check per dimension. |
 | `user` | The value of `USERNAME()` and `USERPRINCIPALNAME()`. |

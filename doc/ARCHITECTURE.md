@@ -56,14 +56,16 @@ Source data arrives at 5-minute resolution (rooftop solar every half hour). The 
 
 One semantic model (`semantic_model/model.bim`), its clients under `dashboard/`:
 
-- `github/` and `fabric_app_wasm/` are one page (`dashboard/github/common/index.html`) on two hosts. A
+- `github/` and `fabric_app/wasm/` are one page (`dashboard/github/common/index.html`) on two hosts. A
   host only decides where the data files live and how the browser gets them
   (`storage/data.js`), so a chart is written once and reaches both.
 - `powerbi_report/` is a Power BI report (`nem.Report`, as JSON) on the model as deployed to Fabric,
   which reads the Iceberg tables in Direct Lake. `deploy_model.yml` publishes the two together.
-- `fabric_app_vertipaq/` is a placeholder (a README): the page as a Fabric app next to the
-  deployed model, its queries run by Power BI. It is not built: the model's workspace is on a
-  capacity in Australia Southeast, where Fabric apps (preview) are not available.
+- `fabric_app/vertipaq/` is the page as a Fabric app with the deployed model as its engine,
+  its queries run by Power BI. `deploy_fabric.yml` installs it with the rest of the project
+  (lakehouse, `fabric_items/` notebook and pipeline, model, report) into one workspace. The
+  two Fabric apps share `fabric_app/common/` (the build and the sign-in), as the GitHub
+  page's two ways of asking share `github/common/`.
 
 A measure is written once, in the model, and reaches every client.
 
@@ -74,8 +76,8 @@ A measure is written once, in the model, and reaches every client.
 | Engine | DuckDB-WASM, in the browser | DuckDB-WASM, in the browser | VertiPaq, in Fabric |
 | Data | `.duckdb` files next to the page | the same files in a lakehouse, under `Files/data` | the `mart` Iceberg tables, Direct Lake, no copy |
 | 5-minute history | one file per half-year, downloaded | the same files, downloaded as parallel range requests | — |
-| Host code | `dashboard/github/common/storage/data.js` | `dashboard/fabric_app_wasm/site/storage/` | — |
-| Deployed by | `build.yml` (page), `import_data.yml` (data) | `rayfin up` from `dashboard/fabric_app_wasm/` (page), `import_onelake.yml` (data) | `deploy_model.yml` |
+| Host code | `dashboard/github/common/storage/data.js` | `dashboard/fabric_app/wasm/site/storage/` | — |
+| Deployed by | `build.yml` (page), `import_data.yml` (data) | `rayfin up` from `dashboard/fabric_app/wasm/` (page), `import_onelake.yml` (data) | `deploy_model.yml` |
 
 ### The layers of the dashboard
 
@@ -87,17 +89,16 @@ on purpose: the point is the layers, not their maturity.
 | Consumer | `dashboard/github/common/index.html` | the BI tool |
 | Query language | a query of the model's fields (`frontend/queries.js`), which the compiler writes as DAX | DAX, MDX, VizQL, Malloy, a metrics request |
 | Semantic model | `semantic_model/model.bim`, a Tabular model in TMSL | a Tabular model (TMSL, TMDL), LookML, MetricFlow YAML |
-| Compiler | `dashboard/github/dax/semantic/compiler.js` | MetricFlow, Cube's schema compiler, Malloy's compiler, Looker's SQL generator, Power BI's formula engine, Tableau's VizQL |
+| Compiler | `packages/dax-sql` | MetricFlow, Cube's schema compiler, Malloy's compiler, Looker's SQL generator, Power BI's formula engine, Tableau's VizQL |
 | Engine | DuckDB-WASM | the warehouse, VertiPaq, Hyper |
 | Storage | `dashboard/github/common/storage/` | the lakehouse or warehouse connection |
 
 - **The semantic model** describes the tables, their relationships and the measures, each
   with a description. It is a real Power BI model (`model.bim`), the same file that is
   deployed to Fabric: it holds DAX only, and nothing in it is written for the page.
-- **The compiler** turns its relationships into DuckDB views, over the views of the
-  tables that storage has, writes the page's queries as DAX, and turns the DAX into SQL
-  over them. It is a toy, on purpose: it knows the constructs this page uses, by fixed
-  cases, and throws on anything else.
+- **The compiler** writes the page's queries as DAX, and turns the DAX into SQL over the
+  views of the tables that storage has: `packages/dax-sql`, a general DAX compiler that
+  knows nothing of this model or this page.
 - **The query language** is where the layers show. SQL asks for tables, while a semantic
   model offers tables that know how they relate; the page asks for `Generation MW` by
   `dim_duid.FuelSourceDescriptor` and the compiler works out that the two have to be
@@ -147,9 +148,9 @@ Built with [Rayfin](https://www.npmjs.com/package/@microsoft/rayfin-cli). Fabric
 page and signs you in, and the page reads its data directly from OneLake: no backend to run,
 no query service.
 
-![The dashboard as a Fabric app](../dashboard/fabric_app_wasm/screenshots.png)
+![The dashboard as a Fabric app](../dashboard/fabric_app/wasm/screenshots.png)
 
-![Architecture of the Fabric app](../dashboard/fabric_app_wasm/architecture.svg)
+![Architecture of the Fabric app](../dashboard/fabric_app/wasm/architecture.svg)
 
 - **Hosting:** `rayfin up` deploys the page to Fabric static hosting.
 - **Sign-in:** Fabric single sign-on. Inside the Fabric portal there is no extra login; in
@@ -175,9 +176,12 @@ no query service.
 │   │   ├── common/       # index.html, frontend/ (draws, Logs tab), storage/ (the host, the tables as views), dag/ (dbt docs)
 │   │   ├── dax/          # through the semantic model: frontend/queries.js, semantic/ (the compiler); served at /
 │   │   └── sql/          # in plain SQL, no semantic layer: frontend/queries.js; served at sql/
-│   ├── fabric_app_wasm/     # The same page as a Fabric app on DuckDB-WASM: its host code, sign-in, and the Rayfin project
-│   ├── fabric_app_vertipaq/ # The page as a Fabric app on the deployed model: not built (a README)
+│   ├── fabric_app/       # The same page as a Fabric app, and its two backends
+│   │   ├── common/       # build.mjs and the Fabric sign-in (site/storage/auth.js)
+│   │   ├── wasm/         # DuckDB-WASM over a copy of the tables: its host code and the Rayfin project (deployed)
+│   │   └── vertipaq/     # the deployed model as the engine: its host code and the Rayfin project (deploy_fabric.yml)
 │   └── powerbi_report/   # A report over the deployed model
+├── fabric_items/         # The lakehouse, notebook and pipeline deploy_fabric.yml installs into a workspace
 ├── doc/                  # This file and the architecture diagram
 ├── tests/                # dbt data tests
 ├── .github/workflows/    # CI/CD pipelines
@@ -201,8 +205,10 @@ no query service.
   three round trips each, which is far slower than one download.
 - **Limited by the browser.** A tab gets about 4 GB of memory; a query that needs more fails.
   Phones and old laptops will struggle.
-- **The compiler covers this page only.** It is not a DAX engine; where DAX and SQL differ,
-  its result is SQL's, and its header lists every such place.
+- **The compiler is slower than hand-written SQL.** It computes what DAX says without
+  knowing the data (the hours of each plant's regions, not of all of them), and writes
+  larger queries than a person would: about 1.6 times the hand-written compiler's time
+  over the page's queries, one thread.
 - **A stored value is never revised.** Until merges may update, a correction from AEMO does
   not land, `dim_duid` changes only through a rebuild, and `fct_summary` keeps the intraday
   value of an interval where the next-day files have another.
@@ -215,9 +221,9 @@ The Fabric app has limits of its own:
   sign in and read the data. For them there is no row-level or column-level security.
 - **No public access.** Every visitor signs in with a Fabric account the app is shared with.
 - **Only the item's owner can deploy to it.** An app deployed from a laptop cannot then be
-  deployed from CI, or the reverse: each identity deploys the item it created. CI deploys
-  are blocked by microsoft/rayfin#89 (functions fail on an item owned by a service
-  principal), so the app is deployed from the owner's laptop.
+  deployed from CI, or the reverse: each identity deploys the item it created. The
+  DuckDB-WASM app is deployed from the owner's laptop: its function fails on an item owned
+  by a service principal (microsoft/rayfin#89).
 
 ## Open items
 
@@ -229,10 +235,7 @@ The Fabric app has limits of its own:
   together, for one DuckDB version end to end.
 - DuckDB-WASM with Iceberg on Azure (below).
 - duckdb-iceberg#1341 (`expire_snapshots`): replace pyiceberg.
-- microsoft/rayfin#89: deploy the DuckDB-WASM Fabric app from CI (`deploy_fabric.yml`,
-  `app=wasm`).
-- Fabric apps in Australia Southeast, or a workspace in a region that has them: build the
-  VertiPaq app.
+- microsoft/rayfin#89: deploy the DuckDB-WASM Fabric app from CI.
 - AEMO publishing `ROOFTOP_PV_ACTUAL_PRED`/`_RUN`: move `fct_rooftop_pv` to the 5-minute
   estimate when `ROOFTOP_PV_ACTUAL` stops.
 
@@ -247,7 +250,7 @@ The Fabric app has limits of its own:
 No open-source language and runtime has DAX's semantics, so SQL with WHERE parameters is
 always the shortest path for an AI writing a client: each chart is correct on its own, and
 what is lost is one definition across clients. Five additions would make the right path the
-easy one, each replacing a part of `compiler.js`:
+easy one, each replacing work the compiler does:
 
 1. **Measures in the catalog:** `CREATE MEASURE fct_summary.capacity_factor AS ...`,
    called by name, evaluated in the query's context. *Replaces:* inlining.
@@ -347,7 +350,7 @@ Everything else is Rayfin — see the
 [Rayfin documentation](https://learn.microsoft.com/fabric/embedded/rayfin/overview):
 
 ```bash
-cd dashboard/fabric_app_wasm
+cd dashboard/fabric_app/wasm
 npm ci && npm ci --prefix rayfin/functions
 npx rayfin login      # sign in to Fabric
 npx rayfin up         # build + deploy to Fabric static hosting; prints the hosting URL
